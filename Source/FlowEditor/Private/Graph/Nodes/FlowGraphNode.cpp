@@ -902,6 +902,18 @@ void UFlowGraphNode::OnNodeDoubleClicked() const
 				{
 					OnNodeDoubleClickedInPIE();
 				}
+				else
+				{
+					// Edit mode: pass navigation stack so the child editor can show a breadcrumb
+					if (UFlowAsset* SubFlowAsset = Cast<UFlowAsset>(AssetToEdit))
+					{
+						if (const UFlowAsset* OwnerAsset = GetFlowAsset())
+						{
+							SubFlowAsset->EditNavParents = OwnerAsset->EditNavParents;
+							SubFlowAsset->EditNavParents.Add(TSoftObjectPtr<UFlowAsset>(const_cast<UFlowAsset*>(OwnerAsset)));
+						}
+					}
+				}
 			}
 			else if (DoubleClickTarget == EFlowNodeDoubleClickTarget::PrimaryAssetOrNodeDefinition)
 			{

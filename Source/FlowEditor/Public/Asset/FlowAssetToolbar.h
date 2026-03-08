@@ -81,8 +81,8 @@ protected:
  */
 struct FLOWEDITOR_API FFlowBreadcrumb
 {
-	const TWeakObjectPtr<const UFlowAsset> CurrentInstance;
-	const TWeakObjectPtr<const UFlowAsset> ChildInstance;
+	TWeakObjectPtr<UFlowAsset> CurrentInstance;
+	TWeakObjectPtr<UFlowAsset> ChildInstance;
 
 	FFlowBreadcrumb()
 		: CurrentInstance(nullptr)
@@ -90,7 +90,7 @@ struct FLOWEDITOR_API FFlowBreadcrumb
 	{
 	}
 
-	explicit FFlowBreadcrumb(const TWeakObjectPtr<const UFlowAsset> InCurrentInstance, const TWeakObjectPtr<const UFlowAsset> InChildInstance)
+	explicit FFlowBreadcrumb(const TWeakObjectPtr<UFlowAsset> InCurrentInstance, const TWeakObjectPtr<UFlowAsset> InChildInstance)
 		: CurrentInstance(InCurrentInstance)
 		, ChildInstance(InChildInstance)
 	{

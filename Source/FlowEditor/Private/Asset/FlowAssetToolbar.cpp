@@ -299,49 +299,115 @@ void SFlowAssetBreadcrumb::Construct(const FArguments& InArgs, const TWeakObject
 
 EVisibility SFlowAssetBreadcrumb::GetBreadcrumbVisibility() const
 {
-	return GEditor->PlayWorld && TemplateAsset->GetInspectedInstance() ? EVisibility::Visible : EVisibility::Collapsed;
+	if (GEditor->PlayWorld)
+	{
+		return TemplateAsset->GetInspectedInstance() ? EVisibility::Visible : EVisibility::Collapsed;
+	}
+	// Edit mode: show breadcrumb when this asset was navigated to from a parent
+	return (TemplateAsset.IsValid() && TemplateAsset->EditNavParents.Num() > 0) ? EVisibility::Visible : EVisibility::Collapsed;
 }
 
 void SFlowAssetBreadcrumb::FillBreadcrumb() const
 {
 	BreadcrumbTrail->ClearCrumbs();
-	if (const UFlowAsset* InspectedInstance = TemplateAsset->GetInspectedInstance())
+
+	if (GEditor->PlayWorld)
 	{
-		TArray<TWeakObjectPtr<const UFlowAsset>> InstancesFromRoot = {InspectedInstance};
-
-		const UFlowAsset* CheckedInstance = InspectedInstance;
-		while (UFlowAsset* ParentInstance = CheckedInstance->GetParentInstance())
+		// PIE mode: walk the runtime instance chain
+		if (UFlowAsset* InspectedInstance = const_cast<UFlowAsset*>(TemplateAsset->GetInspectedInstance()))
 		{
-			InstancesFromRoot.Insert(ParentInstance, 0);
-			CheckedInstance = ParentInstance;
+			TArray<TWeakObjectPtr<UFlowAsset>> InstancesFromRoot = {InspectedInstance};
+
+			const UFlowAsset* CheckedInstance = InspectedInstance;
+			while (UFlowAsset* ParentInstance = CheckedInstance->GetParentInstance())
+			{
+				InstancesFromRoot.Insert(ParentInstance, 0);
+				CheckedInstance = ParentInstance;
+			}
+
+			for (int32 Index = 0; Index < InstancesFromRoot.Num(); Index++)
+			{
+				TWeakObjectPtr<UFlowAsset> Instance = InstancesFromRoot[Index];
+				TWeakObjectPtr<UFlowAsset> ChildInstance = Index < InstancesFromRoot.Num() - 1 ? InstancesFromRoot[Index + 1] : nullptr;
+
+				BreadcrumbTrail->PushCrumb(FText::FromName(Instance->GetDisplayName()), FFlowBreadcrumb(Instance, ChildInstance));
+			}
+		}
+	}
+	else if (TemplateAsset.IsValid())
+	{
+		// Edit mode: build breadcrumb from the stored navigation stack
+		const TArray<TSoftObjectPtr<UFlowAsset>>& NavParents = TemplateAsset->EditNavParents;
+
+		for (int32 Index = 0; Index < NavParents.Num(); Index++)
+		{
+			UFlowAsset* ParentAsset = NavParents[Index].LoadSynchronous();
+			if (ParentAsset)
+			{
+				UFlowAsset* ChildAsset = (Index + 1 < NavParents.Num())
+					? NavParents[Index + 1].LoadSynchronous()
+					: TemplateAsset.Get();
+
+				BreadcrumbTrail->PushCrumb(FText::FromName(ParentAsset->GetFName()), FFlowBreadcrumb(ParentAsset, ChildAsset));
+			}
 		}
 
-		for (int32 Index = 0; Index < InstancesFromRoot.Num(); Index++)
-		{
-			TWeakObjectPtr<const UFlowAsset> Instance = InstancesFromRoot[Index];
-			TWeakObjectPtr<const UFlowAsset> ChildInstance = Index < InstancesFromRoot.Num() - 1 ? InstancesFromRoot[Index + 1] : nullptr;
-
-			BreadcrumbTrail->PushCrumb(FText::FromName(Instance->GetDisplayName()), FFlowBreadcrumb(Instance, ChildInstance));
-		}
+		// Current asset as the final (active) crumb
+		BreadcrumbTrail->PushCrumb(FText::FromName(TemplateAsset->GetFName()), FFlowBreadcrumb(TemplateAsset.Get(), nullptr));
 	}
 }
 
 void SFlowAssetBreadcrumb::OnCrumbClicked(const FFlowBreadcrumb& Item) const
 {
-	const UFlowAsset* InspectedInstance = TemplateAsset->GetInspectedInstance();
-	if (InspectedInstance == nullptr || Item.CurrentInstance != TemplateAsset)
+	if (GEditor->PlayWorld)
 	{
-		const TWeakObjectPtr<const UFlowAsset> ClickedInstance = Item.CurrentInstance;
-		UFlowAsset* ClickedTemplateAsset = ClickedInstance->GetTemplateAsset();
-
-		if (GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(ClickedTemplateAsset))
+		// PIE mode: navigate to a runtime instance
+		const UFlowAsset* InspectedInstance = TemplateAsset->GetInspectedInstance();
+		if (InspectedInstance == nullptr || Item.CurrentInstance != TemplateAsset)
 		{
-			ClickedTemplateAsset->SetInspectedInstance(ClickedInstance);
-			if (const TSharedPtr<FFlowAssetEditor> FlowAssetEditor = FFlowGraphUtils::GetFlowAssetEditor(ClickedTemplateAsset))
+			UFlowAsset* ClickedInstance = Item.CurrentInstance.Get();
+			UFlowAsset* ClickedTemplateAsset = ClickedInstance->GetTemplateAsset();
+
+			if (GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(ClickedTemplateAsset))
 			{
-				if (Item.ChildInstance.IsValid())
+				ClickedTemplateAsset->SetInspectedInstance(ClickedInstance);
+				if (const TSharedPtr<FFlowAssetEditor> FlowAssetEditor = FFlowGraphUtils::GetFlowAssetEditor(ClickedTemplateAsset))
 				{
-					FlowAssetEditor->JumpToNode(Item.ChildInstance->GetNodeOwningThisAssetInstance()->GetGraphNode());
+					if (Item.ChildInstance.IsValid())
+					{
+						FlowAssetEditor->JumpToNode(Item.ChildInstance->GetNodeOwningThisAssetInstance()->GetGraphNode());
+					}
+				}
+			}
+		}
+	}
+	else
+	{
+		// Edit mode: open the clicked ancestor editor and jump to the SubGraph node that leads to the child
+		UFlowAsset* ClickedAsset = Item.CurrentInstance.Get();
+		if (!ClickedAsset || ClickedAsset == TemplateAsset.Get())
+		{
+			return; // clicking the current (last) crumb does nothing
+		}
+
+		if (GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(ClickedAsset))
+		{
+			if (const TSharedPtr<FFlowAssetEditor> ParentEditor = FFlowGraphUtils::GetFlowAssetEditor(ClickedAsset))
+			{
+				UFlowAsset* ChildAsset = Item.ChildInstance.Get();
+				if (ChildAsset)
+				{
+					for (const auto& NodePair : ClickedAsset->GetNodes())
+					{
+						if (UFlowNode_SubGraph* SubGraphNode = Cast<UFlowNode_SubGraph>(NodePair.Value))
+						{
+							if (SubGraphNode->GetAssetToEdit() == ChildAsset)
+							{
+								ParentEditor->JumpToNode(SubGraphNode->GetGraphNode());
+								break;
+							}
+						}
+					}
 				}
 			}
 		}

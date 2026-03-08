@@ -81,6 +81,12 @@ public:
 	static FString ValidationError_NullNodeInstance;
 	static FString ValidationError_NullAddOnNodeInstance;
 
+public:
+	// Edit-mode navigation stack: assets from root to the immediate parent of this asset.
+	// Written when this asset's editor is opened by double-clicking a SubGraph node in edit mode.
+	UPROPERTY(Transient)
+	TArray<TSoftObjectPtr<UFlowAsset>> EditNavParents;
+
 private:
 	UPROPERTY()
 	TObjectPtr<UEdGraph> FlowGraph;
