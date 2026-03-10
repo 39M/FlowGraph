@@ -6,7 +6,9 @@
 #include "AddOns/FlowNodeAddOn.h"
 #include "Nodes/FlowNode.h"
 
+#include "Asset/FlowAssetEditor.h"
 #include "Debugger/FlowDebuggerSubsystem.h"
+#include "Graph/FlowGraphUtils.h"
 
 #include "FlowEditorCommands.h"
 #include "Graph/FlowGraph.h"
@@ -904,13 +906,17 @@ void UFlowGraphNode::OnNodeDoubleClicked() const
 				}
 				else
 				{
-					// Edit mode: pass navigation stack so the child editor can show a breadcrumb
+					// Edit mode: write the navigation chain into the child editor window (not the asset),
+					// so each editor window has independent context when an asset has multiple parents.
 					if (UFlowAsset* SubFlowAsset = Cast<UFlowAsset>(AssetToEdit))
 					{
-						if (const UFlowAsset* OwnerAsset = GetFlowAsset())
+						const TSharedPtr<FFlowAssetEditor> ParentEditor = FFlowGraphUtils::GetFlowAssetEditor(GetFlowAsset());
+						const TSharedPtr<FFlowAssetEditor> ChildEditor  = FFlowGraphUtils::GetFlowAssetEditor(SubFlowAsset);
+						if (ParentEditor && ChildEditor)
 						{
-							SubFlowAsset->EditNavParents = OwnerAsset->EditNavParents;
-							SubFlowAsset->EditNavParents.Add(TSoftObjectPtr<UFlowAsset>(const_cast<UFlowAsset*>(OwnerAsset)));
+							ChildEditor->EditNavParents = ParentEditor->EditNavParents;
+							ChildEditor->EditNavParents.Add(TSoftObjectPtr<UFlowAsset>(GetFlowAsset()));
+							ChildEditor->OnEditNavChanged.Broadcast();
 						}
 					}
 				}

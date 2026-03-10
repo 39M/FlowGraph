@@ -22,7 +22,10 @@
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Text/STextBlock.h"
 
+#include "AssetRegistry/AssetRegistryModule.h"
 #include "AssetToolsModule.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/MultiBox/MultiBoxBuilder.h"
 #include "ISourceControlModule.h"
 #include "ISourceControlProvider.h"
 #include "SourceControlHelpers.h"
@@ -264,13 +267,13 @@ FText SFlowAssetInstanceList::JoinInstanceAndContextTexts(const FObjectKey& Asse
 //////////////////////////////////////////////////////////////////////////
 // Flow Asset Breadcrumb
 
-void SFlowAssetBreadcrumb::Construct(const FArguments& InArgs, const TWeakObjectPtr<UFlowAsset> InTemplateAsset)
+void SFlowAssetBreadcrumb::Construct(const FArguments& InArgs, TWeakObjectPtr<UFlowAsset> InTemplateAsset, TWeakPtr<FFlowAssetEditor> InAssetEditor)
 {
 	TemplateAsset = InTemplateAsset;
+	AssetEditor = InAssetEditor;
 
-	// create breadcrumb
+	// Outer border visibility is the single source of truth; do not restrict the trail itself
 	SAssignNew(BreadcrumbTrail, SBreadcrumbTrail<FFlowBreadcrumb>)
-	.Visibility_Static(&SFlowAssetInstanceList::GetDebuggerVisibility)
 	.OnCrumbClicked(this, &SFlowAssetBreadcrumb::OnCrumbClicked)
 	.ButtonStyle(FAppStyle::Get(), "SimpleButton")
 	.TextStyle(FAppStyle::Get(), "NormalText")
@@ -293,7 +296,13 @@ void SFlowAssetBreadcrumb::Construct(const FArguments& InArgs, const TWeakObject
 		]
 	];
 
+	// PIE refresh
 	TemplateAsset->OnDebuggerRefresh().AddSP(this, &SFlowAssetBreadcrumb::FillBreadcrumb);
+	// Edit-mode refresh: fired after EditNavParents is written by FlowGraphNode
+	if (const TSharedPtr<FFlowAssetEditor> Ed = AssetEditor.Pin())
+	{
+		Ed->OnEditNavChanged.AddSP(this, &SFlowAssetBreadcrumb::FillBreadcrumb);
+	}
 	FillBreadcrumb();
 }
 
@@ -303,57 +312,155 @@ EVisibility SFlowAssetBreadcrumb::GetBreadcrumbVisibility() const
 	{
 		return TemplateAsset->GetInspectedInstance() ? EVisibility::Visible : EVisibility::Collapsed;
 	}
-	// Edit mode: show breadcrumb when this asset was navigated to from a parent
-	return (TemplateAsset.IsValid() && TemplateAsset->EditNavParents.Num() > 0) ? EVisibility::Visible : EVisibility::Collapsed;
+
+	// Edit mode: check editor nav chain first (fast path), then fall back to auto-discovery cache
+	if (const TSharedPtr<FFlowAssetEditor> Ed = AssetEditor.Pin())
+	{
+		if (Ed->EditNavParents.Num() > 0)
+		{
+			return EVisibility::Visible;
+		}
+	}
+	return bHasParentsForDisplay ? EVisibility::Visible : EVisibility::Collapsed;
+}
+
+// Returns all loaded FlowAssets that contain a SubGraph node pointing to ChildAsset.
+// Uses FastGetAsset(false) — only inspects already-loaded objects to avoid synchronous loading.
+static TArray<UFlowAsset*> FindDirectParents(const UFlowAsset* ChildAsset)
+{
+	TArray<UFlowAsset*> Result;
+	if (!ChildAsset) return Result;
+
+	IAssetRegistry& AssetRegistry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>("AssetRegistry").Get();
+
+	TArray<FName> ReferencerPackages;
+	AssetRegistry.GetReferencers(ChildAsset->GetPackage()->GetFName(), ReferencerPackages,
+	                              UE::AssetRegistry::EDependencyCategory::Package);
+
+	for (const FName& PackageName : ReferencerPackages)
+	{
+		TArray<FAssetData> Assets;
+		AssetRegistry.GetAssetsByPackageName(PackageName, Assets);
+
+		for (const FAssetData& AssetData : Assets)
+		{
+			if (!AssetData.IsInstanceOf(UFlowAsset::StaticClass())) continue;
+
+			// Only inspect already-loaded assets — avoids synchronous disk reads
+			UFlowAsset* Candidate = Cast<UFlowAsset>(AssetData.FastGetAsset(false));
+			if (!Candidate) continue;
+
+			for (const auto& NodePair : Candidate->GetNodes())
+			{
+				if (const UFlowNode_SubGraph* Sub = Cast<UFlowNode_SubGraph>(NodePair.Value))
+				{
+					if (Sub->GetAssetToEdit() == ChildAsset)
+					{
+						Result.Add(Candidate);
+						break;
+					}
+				}
+			}
+		}
+	}
+	return Result;
+}
+
+// Opens ParentAsset's editor and jumps to the SubGraph node that references ChildAsset.
+static void NavigateToParent(UFlowAsset* ParentAsset, UFlowAsset* ChildAsset)
+{
+	if (!GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(ParentAsset)) return;
+	const TSharedPtr<FFlowAssetEditor> Ed = FFlowGraphUtils::GetFlowAssetEditor(ParentAsset);
+	if (!Ed || !ChildAsset) return;
+
+	for (const auto& NodePair : ParentAsset->GetNodes())
+	{
+		if (UFlowNode_SubGraph* Sub = Cast<UFlowNode_SubGraph>(NodePair.Value))
+		{
+			if (Sub->GetAssetToEdit() == ChildAsset)
+			{
+				Ed->JumpToNode(Sub->GetGraphNode());
+				break;
+			}
+		}
+	}
+}
+
+void SFlowAssetBreadcrumb::BuildEditModeCrumbs(const TArray<TSoftObjectPtr<UFlowAsset>>& NavParents) const
+{
+	for (int32 i = 0; i < NavParents.Num(); i++)
+	{
+		// NavParents assets are already open (they were navigated through), so LoadSynchronous is safe
+		UFlowAsset* Parent = NavParents[i].LoadSynchronous();
+		if (!Parent) continue;
+		UFlowAsset* Child = (i + 1 < NavParents.Num()) ? NavParents[i + 1].LoadSynchronous() : TemplateAsset.Get();
+		BreadcrumbTrail->PushCrumb(FText::FromName(Parent->GetFName()), FFlowBreadcrumb(Parent, Child));
+	}
+	BreadcrumbTrail->PushCrumb(FText::FromName(TemplateAsset->GetFName()), FFlowBreadcrumb(TemplateAsset.Get(), nullptr));
+	bHasParentsForDisplay = true;
 }
 
 void SFlowAssetBreadcrumb::FillBreadcrumb() const
 {
 	BreadcrumbTrail->ClearCrumbs();
+	bHasParentsForDisplay = false;
 
 	if (GEditor->PlayWorld)
 	{
-		// PIE mode: walk the runtime instance chain
+		// PIE: walk the runtime instance chain
 		if (UFlowAsset* InspectedInstance = const_cast<UFlowAsset*>(TemplateAsset->GetInspectedInstance()))
 		{
 			TArray<TWeakObjectPtr<UFlowAsset>> InstancesFromRoot = {InspectedInstance};
-
 			const UFlowAsset* CheckedInstance = InspectedInstance;
 			while (UFlowAsset* ParentInstance = CheckedInstance->GetParentInstance())
 			{
 				InstancesFromRoot.Insert(ParentInstance, 0);
 				CheckedInstance = ParentInstance;
 			}
-
-			for (int32 Index = 0; Index < InstancesFromRoot.Num(); Index++)
+			for (int32 i = 0; i < InstancesFromRoot.Num(); i++)
 			{
-				TWeakObjectPtr<UFlowAsset> Instance = InstancesFromRoot[Index];
-				TWeakObjectPtr<UFlowAsset> ChildInstance = Index < InstancesFromRoot.Num() - 1 ? InstancesFromRoot[Index + 1] : nullptr;
-
-				BreadcrumbTrail->PushCrumb(FText::FromName(Instance->GetDisplayName()), FFlowBreadcrumb(Instance, ChildInstance));
+				TWeakObjectPtr<UFlowAsset> Child = i < InstancesFromRoot.Num() - 1 ? InstancesFromRoot[i + 1] : nullptr;
+				BreadcrumbTrail->PushCrumb(FText::FromName(InstancesFromRoot[i]->GetDisplayName()),
+				                           FFlowBreadcrumb(InstancesFromRoot[i], Child));
 			}
+		}
+		return;
+	}
+
+	if (!TemplateAsset.IsValid()) return;
+
+	// Edit mode path A: user navigated here via double-click — use the precise chain
+	if (const TSharedPtr<FFlowAssetEditor> Ed = AssetEditor.Pin())
+	{
+		if (Ed->EditNavParents.Num() > 0)
+		{
+			BuildEditModeCrumbs(Ed->EditNavParents);
+			return;
 		}
 	}
-	else if (TemplateAsset.IsValid())
+
+	// Edit mode path B: opened directly from Content Browser — auto-discover loaded parents
+	TArray<UFlowAsset*> DiscoveredParents = FindDirectParents(TemplateAsset.Get());
+	if (DiscoveredParents.Num() == 0) return;
+
+	if (DiscoveredParents.Num() == 1)
 	{
-		// Edit mode: build breadcrumb from the stored navigation stack
-		const TArray<TSoftObjectPtr<UFlowAsset>>& NavParents = TemplateAsset->EditNavParents;
+		TArray<TSoftObjectPtr<UFlowAsset>> SingleParent = {TSoftObjectPtr<UFlowAsset>(DiscoveredParents[0])};
+		BuildEditModeCrumbs(SingleParent);
+	}
+	else
+	{
+		// Multiple parents: push a single indicator crumb with the full list attached
+		FFlowBreadcrumb MultiCrumb;
+		MultiCrumb.ChildInstance = TemplateAsset.Get();
+		for (UFlowAsset* P : DiscoveredParents) MultiCrumb.AllParents.Add(P);
 
-		for (int32 Index = 0; Index < NavParents.Num(); Index++)
-		{
-			UFlowAsset* ParentAsset = NavParents[Index].LoadSynchronous();
-			if (ParentAsset)
-			{
-				UFlowAsset* ChildAsset = (Index + 1 < NavParents.Num())
-					? NavParents[Index + 1].LoadSynchronous()
-					: TemplateAsset.Get();
-
-				BreadcrumbTrail->PushCrumb(FText::FromName(ParentAsset->GetFName()), FFlowBreadcrumb(ParentAsset, ChildAsset));
-			}
-		}
-
-		// Current asset as the final (active) crumb
+		BreadcrumbTrail->PushCrumb(
+			FText::Format(LOCTEXT("MultiParentCrumb", "\u2191 {0} {0}|plural(one=reference,other=references) \u25be"),
+			              FText::AsNumber(DiscoveredParents.Num())),
+			MultiCrumb);
 		BreadcrumbTrail->PushCrumb(FText::FromName(TemplateAsset->GetFName()), FFlowBreadcrumb(TemplateAsset.Get(), nullptr));
+		bHasParentsForDisplay = true;
 	}
 }
 
@@ -361,13 +468,12 @@ void SFlowAssetBreadcrumb::OnCrumbClicked(const FFlowBreadcrumb& Item) const
 {
 	if (GEditor->PlayWorld)
 	{
-		// PIE mode: navigate to a runtime instance
+		// PIE: navigate to the clicked runtime instance
 		const UFlowAsset* InspectedInstance = TemplateAsset->GetInspectedInstance();
 		if (InspectedInstance == nullptr || Item.CurrentInstance != TemplateAsset)
 		{
 			UFlowAsset* ClickedInstance = Item.CurrentInstance.Get();
 			UFlowAsset* ClickedTemplateAsset = ClickedInstance->GetTemplateAsset();
-
 			if (GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(ClickedTemplateAsset))
 			{
 				ClickedTemplateAsset->SetInspectedInstance(ClickedInstance);
@@ -380,38 +486,43 @@ void SFlowAssetBreadcrumb::OnCrumbClicked(const FFlowBreadcrumb& Item) const
 				}
 			}
 		}
+		return;
 	}
-	else
+
+	// Edit mode — multi-parent indicator: show a dropdown so user picks which parent to visit
+	if (Item.IsMultiParent())
 	{
-		// Edit mode: open the clicked ancestor editor and jump to the SubGraph node that leads to the child
-		UFlowAsset* ClickedAsset = Item.CurrentInstance.Get();
-		if (!ClickedAsset || ClickedAsset == TemplateAsset.Get())
+		UFlowAsset* ChildAsset = Item.ChildInstance.Get();
+
+		FMenuBuilder MenuBuilder(true, nullptr);
+		for (const TWeakObjectPtr<UFlowAsset>& ParentWeak : Item.AllParents)
 		{
-			return; // clicking the current (last) crumb does nothing
+			UFlowAsset* ParentAsset = ParentWeak.Get();
+			if (!ParentAsset) continue;
+
+			MenuBuilder.AddMenuEntry(
+				FText::FromName(ParentAsset->GetFName()),
+				FText::GetEmpty(),
+				FSlateIcon(),
+				FUIAction(FExecuteAction::CreateLambda([ParentAsset, ChildAsset]()
+				{
+					NavigateToParent(ParentAsset, ChildAsset);
+				})));
 		}
 
-		if (GEditor->GetEditorSubsystem<UAssetEditorSubsystem>()->OpenEditorForAsset(ClickedAsset))
-		{
-			if (const TSharedPtr<FFlowAssetEditor> ParentEditor = FFlowGraphUtils::GetFlowAssetEditor(ClickedAsset))
-			{
-				UFlowAsset* ChildAsset = Item.ChildInstance.Get();
-				if (ChildAsset)
-				{
-					for (const auto& NodePair : ClickedAsset->GetNodes())
-					{
-						if (UFlowNode_SubGraph* SubGraphNode = Cast<UFlowNode_SubGraph>(NodePair.Value))
-						{
-							if (SubGraphNode->GetAssetToEdit() == ChildAsset)
-							{
-								ParentEditor->JumpToNode(SubGraphNode->GetGraphNode());
-								break;
-							}
-						}
-					}
-				}
-			}
-		}
+		FSlateApplication::Get().PushMenu(
+			AsShared(),
+			FWidgetPath(),
+			MenuBuilder.MakeWidget(),
+			FSlateApplication::Get().GetCursorPos(),
+			FPopupTransitionEffect(FPopupTransitionEffect::ContextMenu));
+		return;
 	}
+
+	// Edit mode — single ancestor crumb: open directly
+	UFlowAsset* ClickedAsset = Item.CurrentInstance.Get();
+	if (!ClickedAsset || ClickedAsset == TemplateAsset.Get()) return; // last crumb (current asset) is non-navigable
+	NavigateToParent(ClickedAsset, Item.ChildInstance.Get());
 }
 
 //////////////////////////////////////////////////////////////////////////
@@ -556,7 +667,7 @@ void FFlowAssetToolbar::BuildDebuggerToolbar(UToolMenu* ToolbarMenu) const
 			FPlayWorldCommands::BuildToolbar(InSection);
 
 			InSection.AddEntry(FToolMenuEntry::InitWidget("AssetInstances", SNew(SFlowAssetInstanceList, Context->GetFlowAsset()), FText(), true));
-			InSection.AddEntry(FToolMenuEntry::InitWidget("AssetBreadcrumb", SNew(SFlowAssetBreadcrumb, Context->GetFlowAsset()), FText(), true));
+			InSection.AddEntry(FToolMenuEntry::InitWidget("AssetBreadcrumb", SNew(SFlowAssetBreadcrumb, Context->GetFlowAsset(), Context->FlowAssetEditor), FText(), true));
 		}
 	}));
 }

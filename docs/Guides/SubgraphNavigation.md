@@ -6,63 +6,65 @@ nav_order: 99
 
 # Subgraph Navigation Breadcrumb
 
-## Problem
+## Overview
 
-When a Level Designer double-clicks a **SubGraph node** in edit mode, the child asset opens in a new editor window. There is no indication of where you are in the asset hierarchy, and no way to quickly return to the parent graph.
-
-Previously the `SFlowAssetBreadcrumb` widget only appeared during PIE (Play In Editor) mode, where it tracked the runtime instance chain. It was invisible during normal editing.
-
-## Solution
-
-Edit-mode breadcrumb navigation is now supported. When you double-click a SubGraph node to open its child asset:
-
-1. The child asset editor shows a breadcrumb trail at the top of the graph area.
-2. Clicking any ancestor in the breadcrumb opens that editor and selects the SubGraph node that leads to the child.
-
-### Example
-
-If your asset hierarchy is:
+When editing nested Flow Graphs, the breadcrumb bar above the graph panel shows where the current asset sits in the hierarchy and lets you jump back to any ancestor in one click.
 
 ```
-MainLevelFlow
-  └── Chapter3        (SubGraph)
-        └── Intro     (SubGraph, currently editing)
+Main Level Flow  ›  Chapter 3  ›  Fade To Black
 ```
 
-The breadcrumb displays:
-
-```
-► MainLevelFlow  ›  Chapter3  ›  Intro
-```
-
-Clicking **Chapter3** opens the Chapter3 editor and focuses the SubGraph node that points to Intro.
+The breadcrumb appears in both **edit mode** (normal editing) and **PIE** (Play In Editor / debug mode).
 
 ---
 
-## Implementation Details
+## Behavior
 
-### Files Changed
+| How the asset was opened | Parents found | Breadcrumb shown |
+|--------------------------|---------------|-----------------|
+| Double-clicked SubGraph node from a parent graph | exact nav path | `Parent › Current` |
+| Double-clicked through multiple levels | full path | `Root › Mid › Current` |
+| Opened directly from Content Browser (parent is loaded) | 1 | `Parent › Current` |
+| Opened directly from Content Browser (multiple parents loaded) | N | `↑ N references ▾ › Current` |
+| Opened directly from Content Browser (no parent loaded) | 0 | no breadcrumb |
+| PIE: viewing inspected runtime instance | runtime chain | instance hierarchy |
+
+**Multi-parent**: clicking `↑ N references ▾` opens a dropdown listing all known parent assets. Selecting one opens that editor and focuses the SubGraph node that references the current asset.
+
+**Note on auto-discovery**: when an asset is opened directly (not via navigation), only parents that are already loaded in memory are discovered. The breadcrumb will appear automatically once a parent has been opened.
+
+---
+
+## Implementation
+
+### Key Design Decision: State Lives on the Editor, Not the Asset
+
+A SubGraph asset can be referenced by multiple parents (`Chapter1`, `Chapter3` both use `FadeToBlack`). Storing the navigation chain on the `UFlowAsset` would be shared state — navigating from `Chapter3` would overwrite the breadcrumb context for an already-open `Chapter1 → FadeToBlack` editor.
+
+**Solution**: `EditNavParents` and `OnEditNavChanged` live on `FFlowAssetEditor`. Each editor window owns its own navigation context. UE guarantees a unique editor instance per asset (`FToolkitManager::FindEditorForAsset`), so "last navigation wins" is the correct and intuitive behavior for a single editor window.
+
+### Timing: Why a Delegate Is Needed
+
+When a user double-clicks a SubGraph node:
+
+1. `OpenEditorForAsset(SubFlowAsset)` is called → child editor builds its toolbar → `SFlowAssetBreadcrumb::Construct` runs → `FillBreadcrumb()` runs → `EditNavParents` is **still empty** at this point
+2. Back in `FlowGraphNode::OnNodeDoubleClicked`, we get the child editor and write `EditNavParents`
+3. We call `ChildEditor->OnEditNavChanged.Broadcast()` → `SFlowAssetBreadcrumb::FillBreadcrumb` is re-invoked → breadcrumb now shows correctly
+
+Without the delegate, the breadcrumb would always be empty on first navigation.
+
+### Auto-Discovery (Content Browser open)
+
+Uses `IAssetRegistry::GetReferencers(PackageName)` to find all packages that reference the current asset. Cross-references with already-loaded `UFlowAsset` objects (via `FAssetData::FastGetAsset(false)`) to avoid synchronous loads. Filters to those that contain a `UFlowNode_SubGraph` pointing to the current asset.
+
+---
+
+## Files Changed
 
 | File | Change |
 |------|--------|
-| `Source/Flow/Public/FlowAsset.h` | Added `EditNavParents` (`TArray<TSoftObjectPtr<UFlowAsset>>`, `Transient`) to store the ancestor chain in edit mode |
-| `Source/FlowEditor/Public/Asset/FlowAssetToolbar.h` | Removed `const` from `FFlowBreadcrumb` weak pointer fields so both PIE and edit-mode assets can share the struct |
-| `Source/FlowEditor/Private/Graph/Nodes/FlowGraphNode.cpp` | In `OnNodeDoubleClicked()`, after opening a sub-asset in edit mode, copies the parent's `EditNavParents` + appends the parent asset itself to the child's `EditNavParents` |
-| `Source/FlowEditor/Private/Asset/FlowAssetToolbar.cpp` | Updated `GetBreadcrumbVisibility()`, `FillBreadcrumb()`, and `OnCrumbClicked()` to handle both PIE and edit-mode paths |
-
-### How Navigation State is Tracked
-
-`EditNavParents` is a `Transient` `UPROPERTY` — it is **not serialized** and resets on editor restart. It is populated only when a user navigates into a subgraph by double-clicking a SubGraph node.
-
-```
-User double-clicks SubGraph node (edit mode)
-  → UFlowGraphNode::OnNodeDoubleClicked()
-      → OpenEditorForAsset(SubFlowAsset)
-      → SubFlowAsset->EditNavParents = Parent->EditNavParents + [Parent]
-  → SFlowAssetBreadcrumb::GetBreadcrumbVisibility() returns Visible
-  → SFlowAssetBreadcrumb::FillBreadcrumb() builds trail from EditNavParents
-```
-
-### PIE Mode Unchanged
-
-The existing runtime breadcrumb (walking `GetParentInstance()` on live instances) is completely unchanged. The edit-mode breadcrumb only activates when `GEditor->PlayWorld == nullptr`.
+| `Source/Flow/Public/FlowAsset.h` | Removed `EditNavParents` (was incorrectly placed on the asset) |
+| `Source/FlowEditor/Public/Asset/FlowAssetEditor.h` | Added `EditNavParents` array and `OnEditNavChanged` delegate |
+| `Source/FlowEditor/Public/Asset/FlowAssetToolbar.h` | `FFlowBreadcrumb`: added `AllParents` for multi-parent crumbs; `SFlowAssetBreadcrumb`: added `AssetEditor` parameter and `bHasParentsForDisplay` cache |
+| `Source/FlowEditor/Private/Asset/FlowAssetToolbar.cpp` | `Construct`, `GetBreadcrumbVisibility`, `FillBreadcrumb`, `OnCrumbClicked`, `BuildDebuggerToolbar` updated; added `FindDirectParents`, `BuildEditModeCrumbs`, `NavigateToParent` helpers |
+| `Source/FlowEditor/Private/Graph/Nodes/FlowGraphNode.cpp` | On SubGraph double-click in edit mode: writes `EditNavParents` to child editor and broadcasts `OnEditNavChanged` |

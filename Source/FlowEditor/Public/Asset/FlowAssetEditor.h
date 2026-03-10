@@ -66,6 +66,15 @@ private:
 	FName CurrentUISelection;
 
 public:
+	// Edit-mode navigation chain: ancestor assets from root to the immediate parent of this editor's asset.
+	// Written by FlowGraphNode when the user double-clicks a SubGraph node in edit mode.
+	// Lives on the editor (not the asset) so each window has independent context.
+	TArray<TSoftObjectPtr<UFlowAsset>> EditNavParents;
+
+	// Fired after EditNavParents is updated so the breadcrumb widget can refresh.
+	FSimpleMulticastDelegate OnEditNavChanged;
+
+public:
 	FFlowAssetEditor();
 	virtual ~FFlowAssetEditor() override;
 

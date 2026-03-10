@@ -84,6 +84,12 @@ struct FLOWEDITOR_API FFlowBreadcrumb
 	TWeakObjectPtr<UFlowAsset> CurrentInstance;
 	TWeakObjectPtr<UFlowAsset> ChildInstance;
 
+	// Populated only for multi-parent indicator crumbs (N > 1 parents reference this asset).
+	// When non-empty, clicking the crumb shows a dropdown listing all parents.
+	TArray<TWeakObjectPtr<UFlowAsset>> AllParents;
+
+	bool IsMultiParent() const { return AllParents.Num() > 0; }
+
 	FFlowBreadcrumb()
 		: CurrentInstance(nullptr)
 		, ChildInstance(nullptr)
@@ -103,21 +109,27 @@ struct FLOWEDITOR_API FFlowBreadcrumb
 class FLOWEDITOR_API SFlowAssetBreadcrumb : public SCompoundWidget
 {
 public:
-	SLATE_BEGIN_ARGS(SFlowAssetInstanceList)
+	SLATE_BEGIN_ARGS(SFlowAssetBreadcrumb)
 	{
 	}
 
 	SLATE_END_ARGS()
 
-	void Construct(const FArguments& InArgs, const TWeakObjectPtr<UFlowAsset> InTemplateAsset);
+	void Construct(const FArguments& InArgs, TWeakObjectPtr<UFlowAsset> InTemplateAsset, TWeakPtr<FFlowAssetEditor> InAssetEditor);
 
 private:
 	EVisibility GetBreadcrumbVisibility() const;
 	void FillBreadcrumb() const;
+	void BuildEditModeCrumbs(const TArray<TSoftObjectPtr<UFlowAsset>>& NavParents) const;
 	void OnCrumbClicked(const FFlowBreadcrumb& Item) const;
 
 	TWeakObjectPtr<UFlowAsset> TemplateAsset;
+	TWeakPtr<FFlowAssetEditor> AssetEditor;
 	TSharedPtr<SBreadcrumbTrail<FFlowBreadcrumb>> BreadcrumbTrail;
+
+	// Cached flag set by FillBreadcrumb; read by GetBreadcrumbVisibility to avoid re-running
+	// discovery logic on every Slate paint pass.
+	mutable bool bHasParentsForDisplay = false;
 };
 
 /**
